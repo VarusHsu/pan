@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"example.com/pan/internal/baidu"
 	"example.com/pan/internal/state"
@@ -17,6 +19,55 @@ import (
 type fakeAPI struct {
 	content []byte
 	offset  int64
+}
+
+type pipelineAPI struct {
+	downloadStarted chan struct{}
+	once            sync.Once
+}
+
+func (p *pipelineAPI) List(ctx context.Context, dir string, _ int) ([]baidu.File, bool, error) {
+	if dir == "/" {
+		return []baidu.File{
+			{FSID: 1, Path: "/later", IsDir: 1},
+			{FSID: 2, Path: "/first.txt", Size: 1},
+		}, false, nil
+	}
+	select {
+	case <-p.downloadStarted:
+		return nil, false, nil
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	case <-time.After(2 * time.Second):
+		return nil, false, fmt.Errorf("child directory was scanned before download started")
+	}
+}
+
+func (p *pipelineAPI) Meta(_ context.Context, fsid int64) (baidu.File, error) {
+	p.once.Do(func() { close(p.downloadStarted) })
+	return baidu.File{FSID: fsid, DLink: "https://example.invalid/file"}, nil
+}
+
+func (p *pipelineAPI) DownloadRequest(_ context.Context, _ string, _ int64) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(bytes.NewReader([]byte("x")))}, nil
+}
+
+func TestRunDownloadsWhileScanning(t *testing.T) {
+	dir := t.TempDir()
+	store, err := state.Open(filepath.Join(dir, ".state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := &pipelineAPI{downloadStarted: make(chan struct{})}
+	d := New(api, store, Options{Output: dir, Workers: 1, Retries: 0})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx, []string{"/"}); err != nil {
+		t.Fatal(err)
+	}
+	if store.Summary().Completed != 1 {
+		t.Fatal("discovered file was not downloaded")
+	}
 }
 
 func (f *fakeAPI) List(_ context.Context, dir string, page int) ([]baidu.File, bool, error) {

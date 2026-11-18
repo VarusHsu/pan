@@ -41,20 +41,8 @@ func New(api API, store *state.Store, opts Options) *Downloader {
 }
 
 func (d *Downloader) Run(ctx context.Context, roots []string) error {
-	fmt.Printf("扫描网盘路径: %s\n", strings.Join(roots, ", "))
-	for _, root := range roots {
-		if err := d.scan(ctx, root, root); err != nil {
-			return err
-		}
-	}
-	files := d.store.Pending()
-	s := d.store.Summary()
-	fmt.Printf("扫描完成：共 %d 个文件，待下载 %d，合计 %.1f%% 已完成\n", s.Total, len(files), s.Percent())
-	if len(files) == 0 {
-		return nil
-	}
-
-	jobs := make(chan state.File)
+	fmt.Printf("边扫描边下载网盘路径: %s\n", strings.Join(roots, ", "))
+	jobs := make(chan state.File, d.opts.Workers*2)
 	var wg sync.WaitGroup
 	var failMu sync.Mutex
 	failed := 0
@@ -74,12 +62,32 @@ func (d *Downloader) Run(ctx context.Context, roots []string) error {
 			}
 		}()
 	}
-sendLoop:
-	for _, f := range files {
+
+	seen := make(map[int64]struct{})
+	discovered := 0
+	enqueue := func(remote baidu.File) error {
+		if _, ok := seen[remote.FSID]; ok {
+			return nil
+		}
+		seen[remote.FSID] = struct{}{}
+		f, err := d.add(remote)
+		if err != nil {
+			return err
+		}
+		discovered++
 		select {
 		case jobs <- f:
+			return nil
 		case <-ctx.Done():
-			break sendLoop
+			return ctx.Err()
+		}
+	}
+
+	var scanErr error
+	for _, root := range roots {
+		if err := d.scan(ctx, root, root, enqueue); err != nil {
+			scanErr = err
+			break
 		}
 	}
 	close(jobs)
@@ -87,13 +95,18 @@ sendLoop:
 	if ctx.Err() != nil {
 		return fmt.Errorf("已停止，重新运行相同命令即可续传: %w", ctx.Err())
 	}
+	s := d.store.Summary()
+	fmt.Printf("扫描结束：本次发现 %d 个文件，总进度 %.1f%%\n", discovered, s.Percent())
+	if scanErr != nil {
+		return fmt.Errorf("扫描失败（已发现的文件已完成处理）: %w", scanErr)
+	}
 	if failed > 0 {
 		return fmt.Errorf("%d 个文件下载失败；重新运行命令可重试", failed)
 	}
 	return nil
 }
 
-func (d *Downloader) scan(ctx context.Context, path, root string) error {
+func (d *Downloader) scan(ctx context.Context, path, root string, enqueue func(baidu.File) error) error {
 	page := 1
 	for {
 		fmt.Printf("扫描  %s（第 %d 页）\n", path, page)
@@ -101,7 +114,7 @@ func (d *Downloader) scan(ctx context.Context, path, root string) error {
 		if err != nil {
 			// A root can also be a single file. Resolve it by listing its parent.
 			if page == 1 && path == root && path != "/" {
-				return d.scanSingle(ctx, path, root, err)
+				return d.scanSingle(ctx, path, err, enqueue)
 			}
 			return err
 		}
@@ -114,15 +127,19 @@ func (d *Downloader) scan(ctx context.Context, path, root string) error {
 			}
 		}
 		fmt.Printf("发现  %s：%d 个目录，%d 个文件\n", path, dirs, files)
+		// 先投递当前页的文件，让下载与后续目录扫描并行进行。
 		for _, item := range items {
-			if item.IsDir == 1 {
-				if err := d.scan(ctx, item.Path, root); err != nil {
+			if item.IsDir == 0 {
+				if err := enqueue(item); err != nil {
 					return err
 				}
-				continue
 			}
-			if err := d.add(item, root); err != nil {
-				return err
+		}
+		for _, item := range items {
+			if item.IsDir == 1 {
+				if err := d.scan(ctx, item.Path, root, enqueue); err != nil {
+					return err
+				}
 			}
 		}
 		if !more {
@@ -132,7 +149,7 @@ func (d *Downloader) scan(ctx context.Context, path, root string) error {
 	}
 }
 
-func (d *Downloader) scanSingle(ctx context.Context, target, root string, original error) error {
+func (d *Downloader) scanSingle(ctx context.Context, target string, original error, enqueue func(baidu.File) error) error {
 	parent := filepath.ToSlash(filepath.Dir(target))
 	fmt.Printf("识别  %s 可能是文件，正在扫描父目录 %s\n", target, parent)
 	items, _, err := d.api.List(ctx, parent, 1)
@@ -142,19 +159,26 @@ func (d *Downloader) scanSingle(ctx context.Context, target, root string, origin
 	for _, item := range items {
 		if item.Path == target && item.IsDir == 0 {
 			fmt.Printf("发现  文件 %s（%d 字节）\n", item.Path, item.Size)
-			return d.add(item, root)
+			if err := enqueue(item); err != nil {
+				return err
+			}
+			return nil
 		}
 	}
 	return original
 }
 
-func (d *Downloader) add(f baidu.File, root string) error {
+func (d *Downloader) add(f baidu.File) (state.File, error) {
 	rel := strings.TrimPrefix(f.Path, "/")
 	local, err := safeJoin(d.opts.Output, rel)
 	if err != nil {
-		return err
+		return state.File{}, err
 	}
-	return d.store.Upsert(state.File{FSID: f.FSID, RemotePath: f.Path, LocalPath: local, Size: f.Size, MD5: f.MD5})
+	task := state.File{FSID: f.FSID, RemotePath: f.Path, LocalPath: local, Size: f.Size, MD5: f.MD5}
+	if err := d.store.Upsert(task); err != nil {
+		return state.File{}, err
+	}
+	return task, nil
 }
 
 func safeJoin(root, rel string) (string, error) {
