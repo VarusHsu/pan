@@ -1,0 +1,7 @@
+/pan
+/downloads/
+*.part
+.pan-config.json
+conf.yaml
+
+
