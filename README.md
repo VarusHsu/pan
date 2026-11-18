@@ -7,7 +7,7 @@
 
 1. 在[百度网盘开放平台](https://pan.baidu.com/union/)创建应用，获得 API Key 和 Secret Key。
 2. 在应用后台配置 OAuth 回调地址，并确保应用已获得网盘文件读取/下载能力。
-3. 安装 Go 1.23+，编译：
+3. 安装 Go 1.20+，编译：
 
 ```bash
 go build -o pan ./cmd/pan
