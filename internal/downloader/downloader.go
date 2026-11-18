@@ -96,6 +96,7 @@ sendLoop:
 func (d *Downloader) scan(ctx context.Context, path, root string) error {
 	page := 1
 	for {
+		fmt.Printf("扫描  %s（第 %d 页）\n", path, page)
 		items, more, err := d.api.List(ctx, path, page)
 		if err != nil {
 			// A root can also be a single file. Resolve it by listing its parent.
@@ -104,6 +105,15 @@ func (d *Downloader) scan(ctx context.Context, path, root string) error {
 			}
 			return err
 		}
+		dirs, files := 0, 0
+		for _, item := range items {
+			if item.IsDir == 1 {
+				dirs++
+			} else {
+				files++
+			}
+		}
+		fmt.Printf("发现  %s：%d 个目录，%d 个文件\n", path, dirs, files)
 		for _, item := range items {
 			if item.IsDir == 1 {
 				if err := d.scan(ctx, item.Path, root); err != nil {
@@ -124,12 +134,14 @@ func (d *Downloader) scan(ctx context.Context, path, root string) error {
 
 func (d *Downloader) scanSingle(ctx context.Context, target, root string, original error) error {
 	parent := filepath.ToSlash(filepath.Dir(target))
+	fmt.Printf("识别  %s 可能是文件，正在扫描父目录 %s\n", target, parent)
 	items, _, err := d.api.List(ctx, parent, 1)
 	if err != nil {
 		return original
 	}
 	for _, item := range items {
 		if item.Path == target && item.IsDir == 0 {
+			fmt.Printf("发现  文件 %s（%d 字节）\n", item.Path, item.Size)
 			return d.add(item, root)
 		}
 	}
