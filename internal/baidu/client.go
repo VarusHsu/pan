@@ -117,11 +117,33 @@ func (c *Client) accessToken(ctx context.Context) (string, error) {
 }
 
 type apiResponse struct {
-	Errno     int    `json:"errno"`
-	RequestID int64  `json:"request_id"`
-	List      []File `json:"list"`
-	ErrorMsg  string `json:"errmsg"`
-	HasMore   int    `json:"has_more"`
+	Errno     int       `json:"errno"`
+	RequestID requestID `json:"request_id"`
+	List      []File    `json:"list"`
+	ErrorMsg  string    `json:"errmsg"`
+	HasMore   int       `json:"has_more"`
+}
+
+// request_id 在百度不同接口中可能是 JSON 数字或字符串。它只用于排查请求，
+// 因此按原始文本保存，避免类型变化导致整个 API 响应解析失败。
+type requestID string
+
+func (r *requestID) UnmarshalJSON(b []byte) error {
+	raw := strings.TrimSpace(string(b))
+	if raw == "null" {
+		*r = ""
+		return nil
+	}
+	if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
+		value, err := strconv.Unquote(raw)
+		if err != nil {
+			return err
+		}
+		*r = requestID(value)
+		return nil
+	}
+	*r = requestID(raw)
+	return nil
 }
 
 func (c *Client) List(ctx context.Context, dir string, page int) ([]File, bool, error) {
@@ -203,9 +225,9 @@ func (c *Client) getJSON(ctx context.Context, endpoint string, out any) error {
 	return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(out)
 }
 
-func apiError(action string, errno int, msg string, requestID int64) error {
+func apiError(action string, errno int, msg string, requestID requestID) error {
 	if msg == "" {
 		msg = map[int]string{-6: "身份验证失败或 token 已过期", -7: "文件或目录无权访问", -9: "文件或目录不存在", 31034: "命中接口限流"}[errno]
 	}
-	return fmt.Errorf("%s失败: errno=%d %s (request_id=%d)", action, errno, strings.TrimSpace(msg), requestID)
+	return fmt.Errorf("%s失败: errno=%d %s (request_id=%s)", action, errno, strings.TrimSpace(msg), requestID)
 }
